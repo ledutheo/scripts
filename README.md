@@ -2,35 +2,28 @@
 
 > Collection de scripts utilitaires personnels.
 
-Des petits outils qui me rendent la vie plus simple au quotidien.
+Des outils concrets qui me simplifient la vie sur Arch/Manjaro.
 
-## 📜 Scripts disponibles
+## 📜 Scripts
 
-| Script              | Description                              | Usage                     |
-|---------------------|------------------------------------------|---------------------------|
-| `update-system`     | Mise à jour complète (pacman + AUR)      | `./update-system.sh`      |
-| `cleanup`           | Nettoyage système (cache, journaux, etc) | `./cleanup.sh`            |
-| `dotfiles-update`   | Met à jour les dotfiles                  | `./dotfiles-update.sh`    |
+| Script                | Description                                      |
+|-----------------------|--------------------------------------------------|
+| `update-system.sh`    | Mise à jour complète (pacman + AUR)              |
+| `cleanup.sh`          | Nettoyage système (cache, journaux, orphelins)   |
+| `dotfiles-update.sh`  | Met à jour les dotfiles depuis GitHub            |
+| `backup-configs.sh`   | Sauvegarde rapide des configs importantes        |
+| `aur-info.sh`         | Liste les paquets AUR installés                  |
 
 ## 🚀 Installation
 
 ```bash
 git clone git@github.com:ledutheo/scripts.git ~/scripts
 cd ~/scripts
-
-# Rendre les scripts exécutables
 chmod +x *.sh
 
-# Optionnel : les lier dans ~/.local/bin
-for f in *.sh; do ln -sf "$PWD/$f" "$HOME/.local/bin/${f}"; done
-```
-
-## 🔧 Ajouter au PATH
-
-Si tu veux les avoir dans ton PATH facilement :
-
-```bash
-export PATH="$HOME/scripts:$PATH"
+# Lier dans ~/.local/bin (recommandé)
+mkdir -p ~/.local/bin
+for f in *.sh; do ln -sf "$PWD/$f" "$HOME/.local/bin/"; done
 ```
 
 ## Licence
