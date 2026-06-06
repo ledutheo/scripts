@@ -13,6 +13,7 @@ Des outils concrets qui me simplifient la vie sur Arch/Manjaro.
 | `dotfiles-update.sh`  | Met à jour les dotfiles depuis GitHub            |
 | `backup-configs.sh`   | Sauvegarde rapide des configs importantes        |
 | `aur-info.sh`         | Liste les paquets AUR installés                  |
+| `fix-grok-keyboard-locale.sh` | Répare locale UTF-8 + clavier Grok TUI   |
 
 ## 🚀 Installation
 

@@ -17,7 +17,7 @@ fi
 echo "==> Removing orphaned packages..."
 orphans=$(pacman -Qtdq || true)
 if [[ -n "$orphans" ]]; then
-  sudo pacman -Rns $orphans
+  sudo pacman -Rns -- ${orphans}
 else
   echo "No orphans found."
 fi
