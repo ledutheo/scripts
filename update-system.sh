@@ -15,9 +15,9 @@ elif command -v paru &>/dev/null; then
 fi
 
 echo "==> Removing orphaned packages..."
-orphans=$(pacman -Qtdq || true)
-if [[ -n "$orphans" ]]; then
-  sudo pacman -Rns -- ${orphans}
+mapfile -t orphans < <(pacman -Qtdq 2>/dev/null || true)
+if (( ${#orphans[@]} > 0 )); then
+  sudo pacman -Rns -- "${orphans[@]}"
 else
   echo "No orphans found."
 fi
