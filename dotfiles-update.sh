@@ -7,7 +7,7 @@ DOTFILES_DIR="$HOME/dotfiles"
 
 if [[ ! -d "$DOTFILES_DIR" ]]; then
   echo "Error: $DOTFILES_DIR does not exist"
-  echo "Clone it first: git clone git@github.com:ledutheo/dotfiles.git ~/dotfiles"
+  echo "Clone it first: git clone git@github.com:ledutheo/dotfiles.git ~/github/dotfiles"
   exit 1
 fi
 

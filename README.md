@@ -20,8 +20,8 @@ Voir aussi : [google-takeout-audit](https://github.com/ledutheo/google-takeout-a
 ## 🚀 Installation
 
 ```bash
-git clone git@github.com:ledutheo/scripts.git ~/scripts
-cd ~/scripts
+git clone git@github.com:ledutheo/scripts.git ~/github/scripts
+cd ~/github/scripts
 chmod +x *.sh
 
 # Lier dans ~/.local/bin (recommandé)
