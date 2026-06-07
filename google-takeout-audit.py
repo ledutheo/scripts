@@ -10,7 +10,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote_plus
@@ -156,6 +156,42 @@ TRIVIAL_ADULT_RE = re.compile(
     r"brazzers|youporn|redtube|rule\s*34)$",
     re.I,
 )
+PORN_CONTENT_RE = re.compile(
+    r"pornhub|xnxx|xhamster|brazzers|youporn|redtube|chaturbate|onlyfans|"
+    r"hentai|rule\s*34|nsfw|fetish|fétich|winoai|sexy\s*ai|ai\s*goddess|"
+    r"\bporn\b|pornograph|masturb|fellation|sodom|xnxx|xvideos|"
+    r"body\s*count|bodycount|limewire.*sexy|brazzersnetwork",
+    re.I,
+)
+SHARE_PORN_YEARS_DEFAULT = 7.0
+MONTHS_FR: dict[str, int] = {
+    "janv": 1,
+    "janvier": 1,
+    "févr": 2,
+    "fevr": 2,
+    "février": 2,
+    "fevrier": 2,
+    "mars": 3,
+    "avr": 4,
+    "avril": 4,
+    "mai": 5,
+    "juin": 6,
+    "juil": 7,
+    "juillet": 7,
+    "août": 8,
+    "aout": 8,
+    "sept": 9,
+    "septembre": 9,
+    "oct": 10,
+    "octobre": 10,
+    "nov": 11,
+    "novembre": 11,
+    "déc": 12,
+    "dec": 12,
+    "décembre": 12,
+    "decembre": 12,
+}
+SEARCH_DATE_PARSE_RE = re.compile(r"(\d{1,2})\s+(\w+)\.?\s+(\d{4})", re.I)
 REGRET_PRIORITY_TAGS = (
     "rant",
     "vocal",
@@ -233,6 +269,8 @@ class SearchStats:
     flagged: int = 0
     by_tag: dict[str, int] = field(default_factory=dict)
     regrets: list[dict[str, Any]] = field(default_factory=list)
+    hidden_recent_porn: int = 0
+    share_mode: bool = False
 
 
 def classify_sensitivity(rel_path: str) -> tuple[str, str, str] | None:
@@ -544,6 +582,83 @@ def sample_records_geographic(root: Path, max_points: int = RECORDS_GEO_SAMPLE) 
     return stratified_heat_sample(flat, max_points, cell=cell, foreign_share=0.5)
 
 
+def parse_activity_date(date_str: str) -> datetime | None:
+    if not date_str:
+        return None
+    match = SEARCH_DATE_PARSE_RE.search(date_str)
+    if not match:
+        return None
+    day = int(match.group(1))
+    month_raw = match.group(2).lower().rstrip(".")
+    year = int(match.group(3))
+    month = next((num for key, num in MONTHS_FR.items() if month_raw.startswith(key)), None)
+    if not month:
+        return None
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
+
+def is_within_recent_years(when: datetime | None, years: float) -> bool:
+    """True si la date est dans les N dernières années (ou inconnue → masquer par prudence)."""
+    if when is None:
+        return True
+    cutoff = datetime.now() - timedelta(days=int(years * 365.25))
+    return when >= cutoff
+
+
+def is_porn_regret(query: str, tags: list[str]) -> bool:
+    if "adulte" in tags:
+        return True
+    if PORN_CONTENT_RE.search(query):
+        return True
+    if TRIVIAL_ADULT_RE.match(query.strip()):
+        return True
+    if "intime" in tags and re.search(
+        r"porn|xxx|sexe?y|hentai|nude|nsfw|onlyfans|brazzers|masturb|fellation",
+        query,
+        re.I,
+    ):
+        return True
+    return False
+
+
+def rebuild_search_tags(regrets: list[dict[str, Any]]) -> dict[str, int]:
+    by_tag: dict[str, int] = {}
+    for regret in regrets:
+        for tag in regret["tags"]:
+            by_tag[tag] = by_tag.get(tag, 0) + 1
+    return by_tag
+
+
+def finalize_search_regrets(
+    regrets: list[dict[str, Any]],
+    *,
+    share_mode: bool,
+    porn_years: float,
+) -> SearchStats:
+    searches = SearchStats(share_mode=share_mode)
+    regrets.sort(key=lambda r: (-r["score"], r["date"]))
+
+    if share_mode:
+        kept: list[dict[str, Any]] = []
+        for regret in regrets:
+            if is_porn_regret(regret["query"], regret["tags"]) and is_within_recent_years(
+                parse_activity_date(regret.get("date", "")),
+                porn_years,
+            ):
+                searches.hidden_recent_porn += 1
+                continue
+            kept.append(regret)
+        regrets = kept
+
+    searches.flagged = len(regrets)
+    searches.by_tag = rebuild_search_tags(regrets)
+    searches.regrets = diversify_regrets(regrets)
+    return searches
+
+
 def is_trivial_adult(query: str, tags: list[str]) -> bool:
     q = query.strip().lower()
     if TRIVIAL_ADULT_RE.match(q):
@@ -660,10 +775,10 @@ def score_search_regret(
     return score, tags
 
 
-def parse_activity_and_searches(root: Path) -> tuple[ActivityStats, SearchStats]:
+def parse_activity_and_searches(root: Path) -> tuple[ActivityStats, list[dict[str, Any]], int]:
     """Une seule lecture par fichier HTML (Mon activité + regrets)."""
     activity = ActivityStats()
-    searches = SearchStats()
+    total_searches = 0
     seen_queries: set[tuple[str, str, str]] = set()
     regrets: list[dict[str, Any]] = []
 
@@ -725,7 +840,7 @@ def parse_activity_and_searches(root: Path) -> tuple[ActivityStats, SearchStats]
             block_device = bool(ACTIVITY_PATTERNS["lieu_appareil"].search(block))
             hour = extract_search_hour(block)
 
-            searches.total += 1
+            total_searches += 1
             score, tags = score_search_regret(
                 query,
                 voice=block_voice,
@@ -736,9 +851,6 @@ def parse_activity_and_searches(root: Path) -> tuple[ActivityStats, SearchStats]
             if score < MIN_REGRET_SCORE:
                 continue
 
-            searches.flagged += 1
-            for tag in tags:
-                searches.by_tag[tag] = searches.by_tag.get(tag, 0) + 1
             regrets.append(
                 {
                     "query": query,
@@ -752,9 +864,7 @@ def parse_activity_and_searches(root: Path) -> tuple[ActivityStats, SearchStats]
                 }
             )
 
-    regrets.sort(key=lambda r: (-r["score"], r["date"]))
-    searches.regrets = diversify_regrets(regrets)
-    return activity, searches
+    return activity, regrets, total_searches
 
 
 def build_privacy_findings(
@@ -830,17 +940,24 @@ def build_privacy_findings(
     return findings
 
 
-def build_search_findings(searches: SearchStats) -> list[dict[str, str]]:
+def build_search_findings(searches: SearchStats, *, share_mode: bool, porn_years: float) -> list[dict[str, str]]:
     if not searches.total:
         return []
+    detail = (
+        "Classées par mots-clés (rant, santé, vocal, relation, légal…). "
+        "Voir la section dédiée dans le dashboard."
+    )
+    if share_mode and searches.hidden_recent_porn:
+        cutoff_year = datetime.now().year - int(porn_years)
+        detail += (
+            f" Mode partage : {searches.hidden_recent_porn} recherches adultes "
+            f"depuis {cutoff_year} masquées."
+        )
     findings = [
         {
             "level": "élevé",
             "title": f"{searches.flagged:,} recherches « à regretter » sur {searches.total:,}".replace(",", " "),
-            "detail": (
-                "Classées par mots-clés (intime, santé, vocal, domicile, nocturne…). "
-                "Voir la section dédiée dans le dashboard."
-            ),
+            "detail": detail,
         }
     ]
     if searches.by_tag:
@@ -1080,7 +1197,7 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
   <div class="panel"><h2>Mon activité (compteurs)</h2><table id="activity"><thead><tr><th>Service</th><th>Entrées</th><th>Recherches</th><th>Vocal</th><th>Tag domicile</th></tr></thead><tbody>__STATIC_ACTIVITY__</tbody></table></div>
   <div class="panel" id="regretPanel">
     <h2>😅 Recherches à regretter</h2>
-    <p style="color:#a9b1d6;font-size:.9rem">Mix diversifié (rant, vocal, santé, relation, légal…) — les recherches porno triviales sont reléguées. Filtre par tag ci-dessous.</p>
+    <p style="color:#a9b1d6;font-size:.9rem">Mix diversifié (rant, vocal, santé, relation, légal…). __SHARE_NOTE__ Filtre par tag ci-dessous.</p>
     <div class="regret-toolbar">
       <input id="regretFilter" type="search" placeholder="Filtrer une requête…">
       <span id="regretChips"></span>
@@ -1250,6 +1367,17 @@ def render_html(data: dict[str, Any], output: Path, account: str, total_bytes: i
     content = content.replace(
         "__STATIC_REGRETS__", render_static_regrets(data["searches"]["regrets"])
     )
+    share = data["searches"]
+    if share.get("share_mode") and share.get("hidden_recent_porn"):
+        note = (
+            f"<strong>Mode partage</strong> : {share['hidden_recent_porn']} recherches adultes "
+            f"des {int(share.get('porn_years', 7))} dernières années masquées."
+        )
+    elif share.get("share_mode"):
+        note = "<strong>Mode partage</strong> : porno récent masqué."
+    else:
+        note = ""
+    content = content.replace("__SHARE_NOTE__", note)
     content = content.replace(
         "__DATA_JSON__", json.dumps(chart_data, ensure_ascii=False).replace("</", "<\\/")
     )
@@ -1278,6 +1406,19 @@ def main() -> int:
         "--no-raw-gps",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--share",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Masquer le porno des N dernières années pour partage (défaut: oui)",
+    )
+    parser.add_argument(
+        "--porn-years",
+        type=float,
+        default=SHARE_PORN_YEARS_DEFAULT,
+        metavar="N",
+        help="Fenêtre en années pour masquer le porno en mode --share (défaut: 7)",
     )
     args = parser.parse_args()
 
@@ -1314,7 +1455,15 @@ def main() -> int:
         loc.heat_points = merge_heat_points(loc.heat_points, raw.heat_points, max_total=20000)
 
     log("→ Mon activité + recherches à regretter …")
-    activity, searches = parse_activity_and_searches(root)
+    activity, raw_regrets, search_total = parse_activity_and_searches(root)
+    if args.share:
+        log(f"→ Mode partage : masquage porno < {args.porn_years:g} ans …")
+    searches = finalize_search_regrets(
+        raw_regrets,
+        share_mode=args.share,
+        porn_years=args.porn_years,
+    )
+    searches.total = search_total
     activity_dict = {
         "categories": activity.categories,
         "total_entries": activity.total_entries,
@@ -1324,7 +1473,9 @@ def main() -> int:
     }
 
     findings = build_privacy_findings(inventory, loc, activity)
-    findings.extend(build_search_findings(searches))
+    findings.extend(
+        build_search_findings(searches, share_mode=args.share, porn_years=args.porn_years)
+    )
     account = "roysten699@gmail.com"  # détecté dans archive_browser.html
 
     data = {
@@ -1363,6 +1514,9 @@ def main() -> int:
             "flagged": searches.flagged,
             "by_tag": searches.by_tag,
             "regrets": searches.regrets,
+            "share_mode": searches.share_mode,
+            "hidden_recent_porn": searches.hidden_recent_porn,
+            "porn_years": args.porn_years,
         },
     }
 
@@ -1379,7 +1533,10 @@ def main() -> int:
     if findings:
         log(f"  Alertes: {len(findings)} constats sensibles")
     if searches.total:
-        log(f"  Recherches: {searches.total} extraites, {searches.flagged} à regretter")
+        msg = f"  Recherches: {searches.total} extraites, {searches.flagged} à regretter"
+        if searches.hidden_recent_porn:
+            msg += f" ({searches.hidden_recent_porn} porno récent masqué)"
+        log(msg)
     return 0
 
 
