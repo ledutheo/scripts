@@ -121,10 +121,57 @@ REGRET_RULES: list[tuple[str, str, re.Pattern[str], int]] = [
     ("absurde", "Absurde / impulsif", re.compile(
         r"^(\d{10,}|test|aze|asdf|qwerty|blabla|mdr+|lol+)$", re.I,
     ), 20),
+    ("relationnel", "Ex / relation", re.compile(
+        r"\bmon ex\b|\bma ex\b|\bmon ex\b|rupture|infidél|infidel|tromp(e|é|er)|"
+        r"stalk|harcel|jalous|jealous|plan cul|ghosting|friendzone|"
+        r"célibataire|celibataire|tinder|badoo|meetic",
+        re.I,
+    ), 35),
+    ("argent", "Argent / dette", re.compile(
+        r"dette|crédit|credit|prêt|pret|surendett|fiché banque|fichage|"
+        r"casino|pari sport|bitcoin|crypto|arnaques?|escroc|héritage|heritage",
+        re.I,
+    ), 30),
+    ("legal", "Légal / risque", re.compile(
+        r"avocat|tribunal|plainte|procès|proces|garde à vue|"
+        r"drogue|cannabis|cocaïne|cocaine|mdma|amphét|ecstasy|"
+        r"permis retir|alcootest|contestation pv",
+        re.I,
+    ), 35),
+    ("honte", "Gênant / social", re.compile(
+        r"honte|ridicule|moche|laid|pue|cringe|gênant|genant|"
+        r"personne bizarre|je suis nul|je suis con",
+        re.I,
+    ), 25),
 ]
 
 MIN_REGRET_SCORE = 25
 MAX_REGRET_EXPORT = 400
+REGRET_PER_TAG = 25
+FRANCE_BBOX = (41.0, 51.5, -5.5, 9.5)
+HEAT_MAP_MAX = 8000
+RECORDS_GEO_SAMPLE = 6000
+TRIVIAL_ADULT_RE = re.compile(
+    r"^(pornhub|xnxx|xhamster|porn|xxx|hentai|sexe?|sex|sexy|nsfw|"
+    r"brazzers|youporn|redtube|rule\s*34)$",
+    re.I,
+)
+REGRET_PRIORITY_TAGS = (
+    "rant",
+    "vocal",
+    "sante",
+    "relationnel",
+    "legal",
+    "argent",
+    "politique",
+    "honte",
+    "domicile",
+    "nocturne",
+    "gps",
+    "absurde",
+    "intime",
+    "adulte",
+)
 
 
 def log(msg: str) -> None:
@@ -163,6 +210,8 @@ class LocationStats:
     home_addresses: list[str] = field(default_factory=list)
     work_addresses: list[str] = field(default_factory=list)
     heat_points: list[list[float]] = field(default_factory=list)
+    travel_places: list[dict[str, Any]] = field(default_factory=list)
+    travel_regions: list[str] = field(default_factory=list)
     total_visits: int = 0
     total_trips: int = 0
     raw_points: int = 0
@@ -239,10 +288,84 @@ def e7_to_deg(value: int | float) -> float:
     return float(value) / 1e7
 
 
-def parse_semantic_locations(root: Path, max_heat: int = 8000) -> LocationStats:
+def outside_france(lat: float, lng: float) -> bool:
+    lat_min, lat_max, lng_min, lng_max = FRANCE_BBOX
+    return not (lat_min <= lat <= lat_max and lng_min <= lng <= lng_max)
+
+
+def region_label(lat: float, lng: float) -> str:
+    if 5.0 <= lat <= 20.5 and 97.0 <= lng <= 106.0:
+        return "Thaïlande"
+    if -2.0 <= lat <= 7.5 and 99.0 <= lng <= 120.0:
+        return "Malaisie / Indonésie"
+    if 48.0 <= lat <= 55.5 and 14.0 <= lng <= 24.5:
+        return "Europe centrale / Est"
+    if 49.0 <= lat <= 54.5 and 2.0 <= lng <= 8.5:
+        return "Benelux / nord"
+    if 36.0 <= lat <= 42.0 and 19.0 <= lng <= 30.0:
+        return "Grèce / Balkans"
+    if 35.0 <= lat <= 42.5 and 25.0 <= lng <= 45.0:
+        return "Turquie / Moyen-Orient"
+    return "Hors France"
+
+
+def stratified_heat_sample(
+    points: list[list[float]],
+    max_n: int,
+    *,
+    cell: float = 2.0,
+    foreign_share: float = 0.45,
+) -> list[list[float]]:
+    if len(points) <= max_n:
+        return points
+
+    foreign = [p for p in points if outside_france(p[0], p[1])]
+    domestic = [p for p in points if not outside_france(p[0], p[1])]
+    foreign_budget = min(len(foreign), max(int(max_n * foreign_share), len(foreign)))
+    domestic_budget = max_n - foreign_budget
+
+    def pick(bucket_points: list[list[float]], budget: int) -> list[list[float]]:
+        if len(bucket_points) <= budget:
+            return bucket_points
+        buckets: dict[tuple[int, int], list[list[float]]] = defaultdict(list)
+        for point in bucket_points:
+            key = (round(point[0] / cell), round(point[1] / cell))
+            buckets[key].append(point)
+        chosen: list[list[float]] = []
+        for pts in buckets.values():
+            chosen.append(pts[0])
+        remaining = budget - len(chosen)
+        if remaining > 0:
+            extras = [p for pts in buckets.values() for p in pts[1:]]
+            chosen.extend(extras[:remaining])
+        return chosen[:budget]
+
+    return pick(foreign, foreign_budget) + pick(domestic, domestic_budget)
+
+
+def merge_heat_points(
+    primary: list[list[float]],
+    extra: list[list[float]],
+    max_total: int,
+) -> list[list[float]]:
+    merged = list(primary)
+    seen = {(round(p[0], 3), round(p[1], 3)) for p in merged}
+    for point in extra:
+        key = (round(point[0], 3), round(point[1], 3))
+        if key in seen:
+            continue
+        merged.append(point)
+        seen.add(key)
+        if len(merged) >= max_total:
+            break
+    return merged
+
+
+def parse_semantic_locations(root: Path, max_heat: int = HEAT_MAP_MAX) -> LocationStats:
     stats = LocationStats()
     place_counter: Counter[str] = Counter()
     place_meta: dict[str, dict[str, Any]] = {}
+    all_heat: list[list[float]] = []
     files = sorted(root.rglob("Semantic Location History/**/*.json"))
     years_set: set[int] = set()
 
@@ -278,8 +401,7 @@ def parse_semantic_locations(root: Path, max_heat: int = 8000) -> LocationStats:
                         "lng": e7_to_deg(lng),
                         "type": sem,
                     }
-                    if len(stats.heat_points) < max_heat:
-                        stats.heat_points.append([e7_to_deg(lat), e7_to_deg(lng), 0.4])
+                    all_heat.append([e7_to_deg(lat), e7_to_deg(lng), 0.4])
             if "activitySegment" in obj:
                 seg = obj["activitySegment"]
                 stats.total_trips += 1
@@ -290,8 +412,15 @@ def parse_semantic_locations(root: Path, max_heat: int = 8000) -> LocationStats:
                 for key in ("startLocation", "endLocation"):
                     loc = seg.get(key, {})
                     lat, lng = loc.get("latitudeE7"), loc.get("longitudeE7")
-                    if lat is not None and lng is not None and len(stats.heat_points) < max_heat:
-                        stats.heat_points.append([e7_to_deg(lat), e7_to_deg(lng), 0.15])
+                    if lat is not None and lng is not None:
+                        all_heat.append([e7_to_deg(lat), e7_to_deg(lng), 0.15])
+
+    stats.heat_points = stratified_heat_sample(all_heat, max_heat)
+    region_counts: Counter[str] = Counter()
+    for point in all_heat:
+        if outside_france(point[0], point[1]):
+            region_counts[region_label(point[0], point[1])] += 1
+    stats.travel_regions = [name for name, _ in region_counts.most_common()]
 
     stats.years = sorted(years_set)
     stats.top_places = [
@@ -301,6 +430,20 @@ def parse_semantic_locations(root: Path, max_heat: int = 8000) -> LocationStats:
             **place_meta.get(addr, {"lat": 0, "lng": 0, "type": "UNKNOWN"}),
         }
         for addr, count in place_counter.most_common(25)
+    ]
+    travel_counter: Counter[str] = Counter()
+    for addr, count in place_counter.items():
+        meta = place_meta.get(addr, {})
+        lat, lng = meta.get("lat"), meta.get("lng")
+        if lat and lng and outside_france(lat, lng):
+            travel_counter[addr] = count
+    stats.travel_places = [
+        {
+            "address": addr,
+            "count": count,
+            **place_meta.get(addr, {"lat": 0, "lng": 0, "type": "UNKNOWN"}),
+        }
+        for addr, count in travel_counter.most_common(20)
     ]
     return stats
 
@@ -367,6 +510,85 @@ def sample_records_json(root: Path, max_points: int = 2000) -> LocationStats:
     return stats
 
 
+def sample_records_geographic(root: Path, max_points: int = RECORDS_GEO_SAMPLE) -> list[list[float]]:
+    """Échantillon mondial depuis Records.json (grille géographique, léger)."""
+    records_files = sorted(root.rglob("Records.json"), key=lambda p: p.stat().st_size, reverse=True)
+    if not records_files:
+        return []
+
+    fpath = records_files[0]
+    cell = 2.0
+    bucket_cap = max(4, max_points // 180)
+    buckets: dict[tuple[int, int], list[list[float]]] = defaultdict(list)
+    chunk_size = 8 * 1024 * 1024
+    carry = ""
+
+    with fpath.open(encoding="utf-8", errors="ignore") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk and not carry:
+                break
+            data = carry + chunk
+            for match in RECORD_POINT_RE.finditer(data):
+                lat = e7_to_deg(int(match.group(1)))
+                lng = e7_to_deg(int(match.group(2)))
+                key = (round(lat / cell), round(lng / cell))
+                bucket = buckets[key]
+                if len(bucket) < bucket_cap:
+                    bucket.append([lat, lng, 0.06])
+            carry = data[-256:] if chunk else ""
+            if not chunk:
+                break
+
+    flat = [point for pts in buckets.values() for point in pts]
+    return stratified_heat_sample(flat, max_points, cell=cell, foreign_share=0.5)
+
+
+def is_trivial_adult(query: str, tags: list[str]) -> bool:
+    q = query.strip().lower()
+    if TRIVIAL_ADULT_RE.match(q):
+        return True
+    tag_set = set(tags)
+    if tag_set <= {"adulte", "nocturne"} or tag_set <= {"intime", "adulte", "nocturne"}:
+        if len(q) < 22 and re.search(r"porn|xxx|sexe?y|hentai", q, re.I):
+            return True
+    return False
+
+
+def diversify_regrets(regrets: list[dict[str, Any]], max_export: int = MAX_REGRET_EXPORT) -> list[dict[str, Any]]:
+    picked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for tag in REGRET_PRIORITY_TAGS:
+        count = 0
+        for regret in regrets:
+            if tag not in regret["tags"]:
+                continue
+            key = regret["query"]
+            if key in seen or is_trivial_adult(key, regret["tags"]):
+                continue
+            picked.append(regret)
+            seen.add(key)
+            count += 1
+            if count >= REGRET_PER_TAG:
+                break
+
+    for regret in regrets:
+        if len(picked) >= max_export:
+            break
+        key = regret["query"]
+        if key in seen:
+            continue
+        if is_trivial_adult(key, regret["tags"]) and sum(
+            1 for r in picked if "adulte" in r["tags"] or "intime" in r["tags"]
+        ) >= max_export // 4:
+            continue
+        picked.append(regret)
+        seen.add(key)
+
+    return picked[:max_export]
+
+
 def extract_search_query(block: str) -> str | None:
     m = SEARCH_QUERY_RE.search(block)
     if not m:
@@ -378,7 +600,7 @@ def extract_search_query(block: str) -> str | None:
         m2 = re.search(r"search\?q=([^&]+)", raw)
         if m2:
             raw = m2.group(1)
-    query = unquote_plus(raw).replace("+", " ").strip()
+    query = html.unescape(unquote_plus(raw).replace("+", " ")).strip()
     query = re.sub(r"\s+", " ", query)
     return query[:300] if query else None
 
@@ -432,6 +654,8 @@ def score_search_regret(
         score += 25
         if "rant" not in tags:
             tags.append("rant")
+    if is_trivial_adult(query, tags):
+        score = min(score, 45)
 
     return score, tags
 
@@ -529,7 +753,7 @@ def parse_activity_and_searches(root: Path) -> tuple[ActivityStats, SearchStats]
             )
 
     regrets.sort(key=lambda r: (-r["score"], r["date"]))
-    searches.regrets = regrets[:MAX_REGRET_EXPORT]
+    searches.regrets = diversify_regrets(regrets)
     return activity, searches
 
 
@@ -593,6 +817,16 @@ def build_privacy_findings(
                 "detail": "Google rattache tes recherches à ta position GPS en temps réel.",
             }
         )
+    if loc.travel_regions or loc.travel_places:
+        regions = ", ".join(loc.travel_regions[:6]) if loc.travel_regions else "—"
+        samples = "; ".join(p["address"][:60] for p in loc.travel_places[:4])
+        findings.append(
+            {
+                "level": "élevé",
+                "title": f"Voyages détectés ({len(loc.travel_places)} lieux hors France)",
+                "detail": f"Régions: {regions}. Ex: {samples}",
+            }
+        )
     return findings
 
 
@@ -615,7 +849,8 @@ def build_search_findings(searches: SearchStats) -> list[dict[str, str]]:
             "intime": "intime", "sante": "santé", "adulte": "adulte",
             "vocal": "vocale", "domicile": "au domicile", "nocturne": "nocturne",
             "rant": "rant", "politique": "polémique", "gps": "GPS",
-            "absurde": "absurde",
+            "absurde": "absurde", "relationnel": "relationnel", "argent": "argent",
+            "legal": "légal", "honte": "gênant",
         }
         detail = ", ".join(f"{labels.get(k, k)} ({v})" for k, v in top)
         findings.append(
@@ -639,6 +874,10 @@ TAG_LABELS = {
     "politique": "Polémique",
     "gps": "GPS",
     "absurde": "Absurde",
+    "relationnel": "Relation",
+    "argent": "Argent",
+    "legal": "Légal",
+    "honte": "Gênant",
 }
 
 
@@ -672,6 +911,24 @@ def render_static_findings(findings: list[dict[str, str]]) -> str:
         f"<strong>{html.escape(f['title'])}</strong><br>"
         f'<span style="color:#a9b1d6">{html.escape(f["detail"])}</span></div>'
         for f in findings
+    )
+
+
+def render_static_travel(places: list[dict[str, Any]]) -> str:
+    if not places:
+        return '<p style="color:#565f89;font-size:.85rem">Aucun voyage détecté hors France.</p>'
+    rows = []
+    for place in places:
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(place.get('address', '')))}</td>"
+            f"<td>{place.get('count', 0)}</td>"
+            "</tr>"
+        )
+    return (
+        '<table><thead><tr><th>Lieu</th><th>Visites</th></tr></thead><tbody>'
+        + "".join(rows)
+        + "</tbody></table>"
     )
 
 
@@ -809,7 +1066,7 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
 <div id="error"></div>
 <div class="grid cards" id="cards">__STATIC_CARDS__</div>
 <div class="grid two">
-  <div class="panel"><h2>Carte de chaleur (échantillon)</h2><div id="map"></div></div>
+  <div class="panel"><h2>Carte de chaleur (échantillon mondial)</h2><div id="map"></div><p id="travelSummary" style="color:#565f89;font-size:.85rem;margin-top:.6rem"></p><div id="travelPlaces" style="max-height:180px;overflow:auto;margin-top:.4rem">__STATIC_TRAVEL__</div></div>
   <div class="panel"><h2>Activité par année</h2><canvas id="yearChart"></canvas></div>
 </div>
 <div class="grid two">
@@ -823,7 +1080,7 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
   <div class="panel"><h2>Mon activité (compteurs)</h2><table id="activity"><thead><tr><th>Service</th><th>Entrées</th><th>Recherches</th><th>Vocal</th><th>Tag domicile</th></tr></thead><tbody>__STATIC_ACTIVITY__</tbody></table></div>
   <div class="panel" id="regretPanel">
     <h2>😅 Recherches à regretter</h2>
-    <p style="color:#a9b1d6;font-size:.9rem">Analyse locale par mots-clés — intime, santé, vocal, domicile, nocturne, rant… Filtre pour parcourir vite ce que Google a gardé.</p>
+    <p style="color:#a9b1d6;font-size:.9rem">Mix diversifié (rant, vocal, santé, relation, légal…) — les recherches porno triviales sont reléguées. Filtre par tag ci-dessous.</p>
     <div class="regret-toolbar">
       <input id="regretFilter" type="search" placeholder="Filtrer une requête…">
       <span id="regretChips"></span>
@@ -855,15 +1112,27 @@ function fmtBytes(b) {{
 }}
 try {{
 if (typeof L !== 'undefined' && typeof Chart !== 'undefined') {{
-const map = L.map('map').setView([47.2, -1.55], 6);
+const map = L.map('map').setView([30, 15], 3);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{ attribution:'© OSM' }}).addTo(map);
+const mapBounds = [];
 if (DATA.location.heat_points.length) {{
-  const heat = L.heatLayer(DATA.location.heat_points, {{ radius:12, blur:18, maxZoom:12 }}).addTo(map);
-  const bounds = L.latLngBounds(DATA.location.heat_points.map(p=>[p[0],p[1]]));
-  map.fitBounds(bounds.pad(0.2));
-  DATA.location.top_places.slice(0,8).forEach(p => {{
-    if(p.lat) L.marker([p.lat,p.lng]).addTo(map).bindPopup(`<b>${{p.address}}</b><br>${{p.count}} visites`);
-  }});
+  L.heatLayer(DATA.location.heat_points, {{ radius:10, blur:14, maxZoom:10 }}).addTo(map);
+  DATA.location.heat_points.forEach(p => mapBounds.push([p[0], p[1]]));
+}}
+(DATA.location.travel_places || []).forEach(p => {{
+  if (!p.lat) return;
+  L.circleMarker([p.lat, p.lng], {{ radius:7, color:'#ff9e64', fillColor:'#ff9e64', fillOpacity:.8, weight:2 }}).addTo(map)
+    .bindPopup(`<b>✈️ ${{p.address}}</b><br>${{p.count}} visites`);
+  mapBounds.push([p.lat, p.lng]);
+}});
+if (mapBounds.length) {{
+  map.fitBounds(L.latLngBounds(mapBounds).pad(0.12));
+}} else {{
+  map.setView([47.2, -1.55], 6);
+}}
+const travelSummary = document.getElementById('travelSummary');
+if (travelSummary && (DATA.location.travel_regions || []).length) {{
+  travelSummary.textContent = 'Régions hors France: ' + DATA.location.travel_regions.join(' · ');
 }}
 
 const years = [...new Set([...Object.keys(DATA.location.visits_by_year),...Object.keys(DATA.location.trips_by_year)])].sort();
@@ -896,7 +1165,8 @@ new Chart(document.getElementById('tripChart'), {{
 
 const TAG_LABELS = {{
   intime:'Intime', sante:'Santé', adulte:'Adulte', vocal:'Vocale', domicile:'Domicile',
-  nocturne:'Nocturne', rant:'Rant', politique:'Polémique', gps:'GPS', absurde:'Absurde'
+  nocturne:'Nocturne', rant:'Rant', politique:'Polémique', gps:'GPS', absurde:'Absurde',
+  relationnel:'Relation', argent:'Argent', legal:'Légal', honte:'Gênant'
 }};
 let activeTag = '';
 const regretBody = document.querySelector('#regrets tbody');
@@ -960,7 +1230,7 @@ if (rtags.length) {{
 def render_html(data: dict[str, Any], output: Path, account: str, total_bytes: int) -> None:
     chart_data = dict(data)
     chart_data["location"] = dict(data["location"])
-    chart_data["location"]["heat_points"] = data["location"]["heat_points"][:1500]
+    chart_data["location"]["heat_points"] = data["location"]["heat_points"][:6000]
 
     # Template écrit pour .format() ; on utilise .replace() → dédoubler les accolades.
     content = HTML_TEMPLATE.replace("{{", "{").replace("}}", "}")
@@ -970,6 +1240,9 @@ def render_html(data: dict[str, Any], output: Path, account: str, total_bytes: i
     content = content.replace("__STATIC_CARDS__", render_static_cards(data))
     content = content.replace("__STATIC_FINDINGS__", render_static_findings(data["findings"]))
     content = content.replace("__STATIC_PLACES__", render_static_places(data["location"]["top_places"]))
+    content = content.replace(
+        "__STATIC_TRAVEL__", render_static_travel(data["location"].get("travel_places", []))
+    )
     content = content.replace("__STATIC_AUDIT__", render_static_audit(data["inventory"]))
     content = content.replace(
         "__STATIC_ACTIVITY__", render_static_activity(data["activity"]["categories"])
@@ -1025,13 +1298,20 @@ def main() -> int:
         log("→ Comptage Records.json (streaming) …")
         loc.raw_points = count_records_points(records_files[0])
 
+    log("→ Échantillon GPS mondial (Records.json) …")
+    geo_heat = sample_records_geographic(root)
+    loc.heat_points = merge_heat_points(loc.heat_points, geo_heat, max_total=HEAT_MAP_MAX + RECORDS_GEO_SAMPLE)
+    loc.heat_points = stratified_heat_sample(
+        loc.heat_points, HEAT_MAP_MAX + RECORDS_GEO_SAMPLE, foreign_share=0.5
+    )
+
     use_raw_heat = args.raw_gps and not args.no_raw_gps
     if use_raw_heat:
-        log("→ Échantillon GPS brut pour la carte (--raw-gps) …")
+        log("→ Échantillon GPS brut supplémentaire (--raw-gps) …")
         raw = sample_records_json(root)
         loc.raw_points = raw.raw_points
         loc.raw_years = raw.raw_years
-        loc.heat_points.extend(raw.heat_points)
+        loc.heat_points = merge_heat_points(loc.heat_points, raw.heat_points, max_total=20000)
 
     log("→ Mon activité + recherches à regretter …")
     activity, searches = parse_activity_and_searches(root)
@@ -1057,7 +1337,9 @@ def main() -> int:
             "activity_types": loc.activity_types,
             "home_addresses": loc.home_addresses,
             "work_addresses": loc.work_addresses,
-            "heat_points": loc.heat_points[:12000],
+            "heat_points": loc.heat_points[:14000],
+            "travel_places": loc.travel_places,
+            "travel_regions": loc.travel_regions,
             "total_visits": loc.total_visits,
             "total_trips": loc.total_trips,
             "raw_points": loc.raw_points,
