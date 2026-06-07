@@ -127,6 +127,10 @@ MIN_REGRET_SCORE = 25
 MAX_REGRET_EXPORT = 400
 
 
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def human_size(num: int) -> str:
     for unit in ("o", "Ko", "Mo", "Go", "To"):
         if num < 1024:
@@ -301,34 +305,64 @@ def parse_semantic_locations(root: Path, max_heat: int = 8000) -> LocationStats:
     return stats
 
 
-def sample_records_json(root: Path, max_points: int = 3000) -> LocationStats:
+RECORD_POINT_RE = re.compile(
+    r'"latitudeE7":\s*(-?\d+)\s*,\s*"longitudeE7":\s*(-?\d+)',
+)
+RECORD_YEAR_RE = re.compile(r'"timestamp":\s*"(\d{4})')
+
+
+def count_records_points(fpath: Path) -> int:
+    """Compte les points GPS sans charger le JSON en RAM."""
+    total = 0
+    with fpath.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            total += chunk.count(b'"latitudeE7"')
+    return total
+
+
+def sample_records_json(root: Path, max_points: int = 2000) -> LocationStats:
+    """Échantillonne Records.json en streaming (évite 800+ Mo en RAM)."""
     stats = LocationStats()
     records_files = list(root.rglob("Records.json"))
     if not records_files:
         return stats
-    # Prendre le plus gros fichier (le plus complet)
     records_files.sort(key=lambda p: p.stat().st_size, reverse=True)
     fpath = records_files[0]
-    try:
-        data = json.loads(fpath.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+
+    log(f"  · comptage rapide {fpath.name} ({human_size(fpath.stat().st_size)}) …")
+    stats.raw_points = count_records_points(fpath)
+    if stats.raw_points == 0:
         return stats
-    locations = data.get("locations", [])
-    stats.raw_points = len(locations)
+
     years: set[int] = set()
-    step = max(1, len(locations) // max_points)
-    for i, loc in enumerate(locations):
-        if i % step != 0:
-            continue
-        ts = loc.get("timestamp", "")
-        if len(ts) >= 4:
-            try:
-                years.add(int(ts[:4]))
-            except ValueError:
-                pass
-        lat, lng = loc.get("latitudeE7"), loc.get("longitudeE7")
-        if lat is not None and lng is not None:
-            stats.heat_points.append([e7_to_deg(lat), e7_to_deg(lng), 0.05])
+    step = max(1, stats.raw_points // max_points)
+    seen = 0
+    chunk_size = 8 * 1024 * 1024
+    carry = ""
+
+    with fpath.open(encoding="utf-8", errors="ignore") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk and not carry:
+                break
+            data = carry + chunk
+            for ymatch in RECORD_YEAR_RE.finditer(data):
+                if len(years) < 30:
+                    years.add(int(ymatch.group(1)))
+            for match in RECORD_POINT_RE.finditer(data):
+                if seen % step == 0 and len(stats.heat_points) < max_points:
+                    stats.heat_points.append(
+                        [
+                            e7_to_deg(int(match.group(1))),
+                            e7_to_deg(int(match.group(2))),
+                            0.05,
+                        ]
+                    )
+                seen += 1
+            carry = data[-256:] if chunk else ""
+            if not chunk:
+                break
+
     stats.raw_years = sorted(years)
     return stats
 
@@ -402,26 +436,51 @@ def score_search_regret(
     return score, tags
 
 
-def parse_searches(root: Path) -> SearchStats:
-    stats = SearchStats()
+def parse_activity_and_searches(root: Path) -> tuple[ActivityStats, SearchStats]:
+    """Une seule lecture par fichier HTML (Mon activité + regrets)."""
+    activity = ActivityStats()
+    searches = SearchStats()
     seen_queries: set[tuple[str, str, str]] = set()
     regrets: list[dict[str, Any]] = []
 
     html_files = list(root.rglob("MonActivité.html")) + list(root.rglob("My Activity.html"))
-    processed: set[str] = set()
+    seen_files: set[str] = set()
 
     for fpath in html_files:
-        source = fpath.parent.name
-        if source not in SEARCH_SOURCES:
+        category = fpath.parent.name
+        key = f"{category}:{fpath.stat().st_size}"
+        if key in seen_files:
             continue
-        key = f"{source}:{fpath.stat().st_size}"
-        if key in processed:
-            continue
-        processed.add(key)
+        seen_files.add(key)
 
         try:
+            log(f"  · {category} ({human_size(fpath.stat().st_size)}) …")
             content = fpath.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            continue
+
+        entries = content.count("outer-cell")
+        n_searches = len(ACTIVITY_PATTERNS["recherche"].findall(content))
+        visits = len(ACTIVITY_PATTERNS["consultation"].findall(content))
+        voice = len(ACTIVITY_PATTERNS["vocal"].findall(content))
+        home_tagged = len(ACTIVITY_PATTERNS["lieu_domicile"].findall(content))
+        device_tagged = len(ACTIVITY_PATTERNS["lieu_appareil"].findall(content))
+
+        cat = activity.categories.setdefault(
+            category,
+            {"entries": 0, "searches": 0, "visits": 0, "voice": 0, "home_tagged": 0},
+        )
+        cat["entries"] += entries
+        cat["searches"] += n_searches
+        cat["visits"] += visits
+        cat["voice"] += voice
+        cat["home_tagged"] += home_tagged
+        activity.total_entries += entries
+        activity.voice_entries += voice
+        activity.home_tagged += home_tagged
+        activity.device_tagged += device_tagged
+
+        if category not in SEARCH_SOURCES:
             continue
 
         for block in SEARCH_BLOCK_SPLIT.split(content)[1:]:
@@ -432,80 +491,46 @@ def parse_searches(root: Path) -> SearchStats:
                 continue
 
             date = extract_search_date(block)
-            dedup_key = (source, query, date)
+            dedup_key = (category, query, date)
             if dedup_key in seen_queries:
                 continue
             seen_queries.add(dedup_key)
 
-            voice = bool(ACTIVITY_PATTERNS["vocal"].search(block))
-            home = bool(ACTIVITY_PATTERNS["lieu_domicile"].search(block))
-            device = bool(ACTIVITY_PATTERNS["lieu_appareil"].search(block))
+            block_voice = bool(ACTIVITY_PATTERNS["vocal"].search(block))
+            block_home = bool(ACTIVITY_PATTERNS["lieu_domicile"].search(block))
+            block_device = bool(ACTIVITY_PATTERNS["lieu_appareil"].search(block))
             hour = extract_search_hour(block)
 
-            stats.total += 1
+            searches.total += 1
             score, tags = score_search_regret(
-                query, voice=voice, home=home, device=device, hour=hour
+                query,
+                voice=block_voice,
+                home=block_home,
+                device=block_device,
+                hour=hour,
             )
             if score < MIN_REGRET_SCORE:
                 continue
 
-            stats.flagged += 1
+            searches.flagged += 1
             for tag in tags:
-                stats.by_tag[tag] = stats.by_tag.get(tag, 0) + 1
-
+                searches.by_tag[tag] = searches.by_tag.get(tag, 0) + 1
             regrets.append(
                 {
                     "query": query,
                     "date": date,
-                    "source": source,
+                    "source": category,
                     "score": score,
                     "tags": tags,
-                    "voice": voice,
-                    "home": home,
-                    "device": device,
+                    "voice": block_voice,
+                    "home": block_home,
+                    "device": block_device,
                 }
             )
 
     regrets.sort(key=lambda r: (-r["score"], r["date"]))
-    stats.regrets = regrets[:MAX_REGRET_EXPORT]
-    return stats
-
-
-def parse_activity(root: Path) -> ActivityStats:
-    stats = ActivityStats()
-    html_files = list(root.rglob("MonActivité.html")) + list(root.rglob("My Activity.html"))
-    seen: set[str] = set()
-    for fpath in html_files:
-        # Éviter de recompter le même service si présent dans plusieurs archives
-        key = f"{fpath.parent.name}:{fpath.stat().st_size}"
-        if key in seen:
-            continue
-        seen.add(key)
-        category = fpath.parent.name
-        try:
-            content = fpath.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        entries = content.count("outer-cell")
-        searches = len(ACTIVITY_PATTERNS["recherche"].findall(content))
-        visits = len(ACTIVITY_PATTERNS["consultation"].findall(content))
-        voice = len(ACTIVITY_PATTERNS["vocal"].findall(content))
-        home_tagged = len(ACTIVITY_PATTERNS["lieu_domicile"].findall(content))
-        device_tagged = len(ACTIVITY_PATTERNS["lieu_appareil"].findall(content))
-        cat = stats.categories.setdefault(
-            category,
-            {"entries": 0, "searches": 0, "visits": 0, "voice": 0, "home_tagged": 0},
-        )
-        cat["entries"] += entries
-        cat["searches"] += searches
-        cat["visits"] += visits
-        cat["voice"] += voice
-        cat["home_tagged"] += home_tagged
-        stats.total_entries += entries
-        stats.voice_entries += voice
-        stats.home_tagged += home_tagged
-        stats.device_tagged += device_tagged
-    return stats
+    searches.regrets = regrets[:MAX_REGRET_EXPORT]
+    return activity, searches
 
 
 def build_privacy_findings(
@@ -846,9 +871,14 @@ def main() -> int:
         help="Fichier HTML de sortie (défaut: <takeout>/audit-dashboard.html)",
     )
     parser.add_argument(
+        "--raw-gps",
+        action="store_true",
+        help="Échantillonner Records.json sur la carte (813 Mo+, plus lent)",
+    )
+    parser.add_argument(
         "--no-raw-gps",
         action="store_true",
-        help="Ne pas lire Records.json (813 Mo+) — plus rapide",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
@@ -857,24 +887,28 @@ def main() -> int:
         print(f"Erreur: dossier introuvable: {root}", file=sys.stderr)
         return 1
 
-    print(f"→ Scan de {root} ...")
+    log(f"→ Scan de {root} …")
     inventory = scan_inventory(root)
     total_bytes = sum(i["bytes"] for i in inventory)
 
-    print("→ Géolocalisation (Semantic Location History) ...")
+    log("→ Géolocalisation (Semantic Location History) …")
     loc = parse_semantic_locations(root)
-    if not args.no_raw_gps:
-        print("→ Échantillonnage Records.json (points GPS bruts) ...")
+
+    records_files = sorted(root.rglob("Records.json"), key=lambda p: p.stat().st_size, reverse=True)
+    if records_files:
+        log("→ Comptage Records.json (streaming) …")
+        loc.raw_points = count_records_points(records_files[0])
+
+    use_raw_heat = args.raw_gps and not args.no_raw_gps
+    if use_raw_heat:
+        log("→ Échantillon GPS brut pour la carte (--raw-gps) …")
         raw = sample_records_json(root)
         loc.raw_points = raw.raw_points
         loc.raw_years = raw.raw_years
         loc.heat_points.extend(raw.heat_points)
 
-    print("→ Mon activité (HTML) ...")
-    activity = parse_activity(root)
-
-    print("→ Recherches (analyse « à regretter ») ...")
-    searches = parse_searches(root)
+    log("→ Mon activité + recherches à regretter …")
+    activity, searches = parse_activity_and_searches(root)
     activity_dict = {
         "categories": activity.categories,
         "total_entries": activity.total_entries,
@@ -926,14 +960,16 @@ def main() -> int:
 
     out = Path(args.output) if args.output else root / "audit-dashboard.html"
     render_html(data, out, account, total_bytes)
-    print(f"\n✓ Dashboard généré: {out}")
-    print(f"  Ouvrir: xdg-open '{out}'")
+    log(f"\n✓ Dashboard généré: {out}")
+    log(f"  Ouvrir: xdg-open '{out}'")
     if loc.years:
-        print(f"  Géoloc: {loc.years[0]}–{loc.years[-1]} ({len(loc.years)} ans)")
+        log(f"  Géoloc: {loc.years[0]}–{loc.years[-1]} ({len(loc.years)} ans)")
+    if loc.raw_points:
+        log(f"  Points GPS bruts: {loc.raw_points:,}".replace(",", " "))
     if findings:
-        print(f"  Alertes: {len(findings)} constats sensibles")
+        log(f"  Alertes: {len(findings)} constats sensibles")
     if searches.total:
-        print(f"  Recherches: {searches.total} extraites, {searches.flagged} à regretter")
+        log(f"  Recherches: {searches.total} extraites, {searches.flagged} à regretter")
     return 0
 
 
