@@ -628,6 +628,125 @@ def build_search_findings(searches: SearchStats) -> list[dict[str, str]]:
     return findings
 
 
+TAG_LABELS = {
+    "intime": "Intime",
+    "sante": "Santé",
+    "adulte": "Adulte",
+    "vocal": "Vocale",
+    "domicile": "Domicile",
+    "nocturne": "Nocturne",
+    "rant": "Rant",
+    "politique": "Polémique",
+    "gps": "GPS",
+    "absurde": "Absurde",
+}
+
+
+def fmt_num(value: int) -> str:
+    return f"{value:,}".replace(",", "\u202f")
+
+
+def render_static_cards(data: dict[str, Any]) -> str:
+    loc, act, sea = data["location"], data["activity"], data["searches"]
+    years = loc.get("years") or []
+    span = f"{years[0]}–{years[-1]}" if years else "—"
+    items = [
+        ("Années géoloc", span),
+        ("Visites lieux", fmt_num(loc.get("total_visits", 0))),
+        ("Points GPS bruts", fmt_num(loc.get("raw_points", 0))),
+        ("Entrées activité", fmt_num(act.get("total_entries", 0))),
+        ("Enregistrements vocaux", fmt_num(act.get("voice_entries", 0))),
+        ("Recherches taguées domicile", fmt_num(act.get("home_tagged", 0))),
+        ("À regretter", fmt_num(sea.get("flagged", 0))),
+    ]
+    return "".join(
+        f'<div class="card"><div class="val">{html.escape(str(v))}</div>'
+        f'<div class="lbl">{html.escape(lbl)}</div></div>'
+        for lbl, v in items
+    )
+
+
+def render_static_findings(findings: list[dict[str, str]]) -> str:
+    return "".join(
+        f'<div class="finding {html.escape(f["level"])}">'
+        f"<strong>{html.escape(f['title'])}</strong><br>"
+        f'<span style="color:#a9b1d6">{html.escape(f["detail"])}</span></div>'
+        for f in findings
+    )
+
+
+def render_static_places(places: list[dict[str, Any]]) -> str:
+    rows = []
+    for place in places:
+        typ = str(place.get("type", "")).replace("TYPE_", "")
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(place.get('address', '')))}</td>"
+            f"<td>{place.get('count', 0)}</td>"
+            f"<td>{html.escape(typ)}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+
+def render_static_audit(inventory: list[dict[str, Any]]) -> str:
+    rows = []
+    for item in inventory:
+        rows.append(
+            "<tr>"
+            f'<td class="level-{html.escape(item["level"])}">{html.escape(item["level"])}</td>'
+            f"<td>{html.escape(item['label'])}</td>"
+            f"<td>{human_size(item['bytes'])}</td>"
+            f"<td>{item['files']}</td>"
+            f'<td style="color:#a9b1d6;font-size:.8rem">{html.escape(item["why"])}</td>'
+            "</tr>"
+        )
+    return "".join(rows)
+
+
+def render_static_activity(categories: dict[str, dict[str, int]]) -> str:
+    rows = []
+    for name, stats in sorted(categories.items(), key=lambda x: -x[1]["entries"]):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(name)}</td>"
+            f"<td>{stats['entries']}</td>"
+            f"<td>{stats['searches']}</td>"
+            f"<td>{stats['voice']}</td>"
+            f"<td>{stats['home_tagged']}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+
+def render_static_regrets(regrets: list[dict[str, Any]], limit: int = 120) -> str:
+    rows = []
+    for regret in regrets[:limit]:
+        flags = " ".join(
+            flag
+            for cond, flag in (
+                (regret.get("voice"), "🎤"),
+                (regret.get("home"), "🏠"),
+                (regret.get("device"), "📍"),
+            )
+            if cond
+        )
+        tags = "".join(
+            f'<span class="tag {html.escape(tag)}">{html.escape(TAG_LABELS.get(tag, tag))}</span>'
+            for tag in regret.get("tags", [])
+        )
+        rows.append(
+            '<tr class="regret-row">'
+            f'<td class="score">{regret.get("score", 0)}</td>'
+            f"<td>{html.escape(regret.get('query', ''))}</td>"
+            f"<td>{html.escape(regret.get('date') or '—')}</td>"
+            f"<td>{tags}</td>"
+            f"<td>{flags}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -667,6 +786,8 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
 .finding.élevé {{ border-color:var(--high); }}
 .finding.moyen {{ border-color:var(--med); }}
 .warn {{ background:#3d2e1e; border:1px solid var(--high); border-radius:8px; padding:1rem; margin:1rem 2rem; }}
+.hint {{ background:#1f2335; border:1px solid #414868; border-radius:8px; padding:.8rem 1rem; margin:0 2rem 1rem; color:#a9b1d6; font-size:.9rem; }}
+#error {{ display:none; background:#3d2230; border:1px solid var(--crit); color:var(--crit); padding:1rem; margin:1rem 2rem; border-radius:8px; }}
 .regret-toolbar {{ display:flex; flex-wrap:wrap; gap:.5rem; margin:.8rem 0; align-items:center; }}
 .regret-toolbar input {{ flex:1; min-width:200px; padding:.5rem .8rem; border-radius:6px; border:1px solid #414868; background:#1a1b26; color:var(--text); }}
 .chip {{ padding:.25rem .6rem; border-radius:999px; border:1px solid #414868; background:#1a1b26; color:#a9b1d6; cursor:pointer; font-size:.8rem; }}
@@ -684,7 +805,9 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
   <div class="sub">__ACCOUNT__ · généré le __DATE__ · __SIZE__ analysés · 100% local</div>
 </header>
 <div class="warn">⚠️ Fichier sensible — contient des données de vie privée. Ne pas partager, ne pas héberger en ligne.</div>
-<div class="grid cards" id="cards"></div>
+<div class="hint">💡 Ouvre via <code>~/scripts/takeout-audit.sh</code> ou <code>python3 -m http.server</code> dans ce dossier — <code>xdg-open file://</code> bloque souvent les graphiques.</div>
+<div id="error"></div>
+<div class="grid cards" id="cards">__STATIC_CARDS__</div>
 <div class="grid two">
   <div class="panel"><h2>Carte de chaleur (échantillon)</h2><div id="map"></div></div>
   <div class="panel"><h2>Activité par année</h2><canvas id="yearChart"></canvas></div>
@@ -694,10 +817,10 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
   <div class="panel"><h2>Types de déplacement</h2><canvas id="tripChart"></canvas></div>
 </div>
 <div class="grid">
-  <div class="panel"><h2>🌶️ Ce qui est crousty</h2><div id="findings"></div></div>
-  <div class="panel"><h2>Top lieux visités</h2><table id="places"><thead><tr><th>Lieu</th><th>Visites</th><th>Type</th></tr></thead><tbody></tbody></table></div>
-  <div class="panel"><h2>Audit par catégorie</h2><table id="audit"><thead><tr><th>Niveau</th><th>Catégorie</th><th>Taille</th><th>Fichiers</th><th>Risque</th></tr></thead><tbody></tbody></table></div>
-  <div class="panel"><h2>Mon activité (compteurs)</h2><table id="activity"><thead><tr><th>Service</th><th>Entrées</th><th>Recherches</th><th>Vocal</th><th>Tag domicile</th></tr></thead><tbody></tbody></table></div>
+  <div class="panel"><h2>🌶️ Ce qui est crousty</h2><div id="findings">__STATIC_FINDINGS__</div></div>
+  <div class="panel"><h2>Top lieux visités</h2><table id="places"><thead><tr><th>Lieu</th><th>Visites</th><th>Type</th></tr></thead><tbody>__STATIC_PLACES__</tbody></table></div>
+  <div class="panel"><h2>Audit par catégorie</h2><table id="audit"><thead><tr><th>Niveau</th><th>Catégorie</th><th>Taille</th><th>Fichiers</th><th>Risque</th></tr></thead><tbody>__STATIC_AUDIT__</tbody></table></div>
+  <div class="panel"><h2>Mon activité (compteurs)</h2><table id="activity"><thead><tr><th>Service</th><th>Entrées</th><th>Recherches</th><th>Vocal</th><th>Tag domicile</th></tr></thead><tbody>__STATIC_ACTIVITY__</tbody></table></div>
   <div class="panel" id="regretPanel">
     <h2>😅 Recherches à regretter</h2>
     <p style="color:#a9b1d6;font-size:.9rem">Analyse locale par mots-clés — intime, santé, vocal, domicile, nocturne, rant… Filtre pour parcourir vite ce que Google a gardé.</p>
@@ -708,29 +831,30 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
     <canvas id="regretChart" height="80"></canvas>
     <p id="regretSummary" style="color:#565f89;font-size:.85rem"></p>
     <div style="max-height:520px;overflow:auto;margin-top:.5rem">
-      <table id="regrets"><thead><tr><th>Score</th><th>Requête</th><th>Date</th><th>Tags</th><th>Flags</th></tr></thead><tbody></tbody></table>
+      <table id="regrets"><thead><tr><th>Score</th><th>Requête</th><th>Date</th><th>Tags</th><th>Flags</th></tr></thead><tbody id="regretRows">__STATIC_REGRETS__</tbody></table>
     </div>
   </div>
 </div>
+<script id="audit-data" type="application/json">__DATA_JSON__</script>
 <script>
-const DATA = __DATA_JSON__;
+function showError(msg) {{
+  const box = document.getElementById('error');
+  if (box) {{ box.style.display = 'block'; box.textContent = msg; }}
+}}
+let DATA;
+try {{
+  DATA = JSON.parse(document.getElementById('audit-data').textContent);
+}} catch (err) {{
+  showError('Données illisibles: ' + err);
+  throw err;
+}}
 function fmtBytes(b) {{
   const u=['o','Ko','Mo','Go']; let i=0, n=b;
   while(n>=1024&&i<u.length-1){{n/=1024;i++;}}
   return (i?n.toFixed(1):n)+' '+u[i];
 }}
-const cards = [
-  ['Années géoloc', DATA.location.years.length ? DATA.location.years[0]+'–'+DATA.location.years[DATA.location.years.length-1] : '—'],
-  ['Visites lieux', DATA.location.total_visits.toLocaleString('fr')],
-  ['Points GPS bruts', DATA.location.raw_points.toLocaleString('fr')],
-  ['Entrées activité', DATA.activity.total_entries.toLocaleString('fr')],
-  ['Enregistrements vocaux', DATA.activity.voice_entries],
-  ['Recherches taguées domicile', DATA.activity.home_tagged],
-  ['À regretter', DATA.searches.flagged.toLocaleString('fr')],
-];
-document.getElementById('cards').innerHTML = cards.map(([l,v])=>
-  `<div class="card"><div class="val">${{v}}</div><div class="lbl">${{l}}</div></div>`).join('');
-
+try {{
+if (typeof L !== 'undefined' && typeof Chart !== 'undefined') {{
 const map = L.map('map').setView([47.2, -1.55], 6);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{ attribution:'© OSM' }}).addTo(map);
 if (DATA.location.heat_points.length) {{
@@ -766,29 +890,9 @@ new Chart(document.getElementById('tripChart'), {{
   options:{{ plugins:{{legend:{{labels:{{color:'#c0caf5'}}}} }} }}
 }});
 
-document.getElementById('findings').innerHTML = DATA.findings.map(f=>
-  `<div class="finding ${{f.level}}"><strong>${{f.title}}</strong><br><span style="color:#a9b1d6">${{f.detail}}</span></div>`).join('');
-
-const ptbody = document.querySelector('#places tbody');
-DATA.location.top_places.forEach(p => {{
-  const tr = document.createElement('tr');
-  tr.innerHTML = `<td>${{p.address}}</td><td>${{p.count}}</td><td>${{p.type.replace('TYPE_','')}}</td>`;
-  ptbody.appendChild(tr);
-}});
-
-const atbody = document.querySelector('#audit tbody');
-DATA.inventory.forEach(i => {{
-  const tr = document.createElement('tr');
-  tr.innerHTML = `<td class="level-${{i.level}}">${{i.level}}</td><td>${{i.label}}</td><td>${{fmtBytes(i.bytes)}}</td><td>${{i.files}}</td><td style="color:#a9b1d6;font-size:.8rem">${{i.why}}</td>`;
-  atbody.appendChild(tr);
-}});
-
-const actbody = document.querySelector('#activity tbody');
-Object.entries(DATA.activity.categories).sort((a,b)=>b[1].entries-a[1].entries).forEach(([k,v]) => {{
-  const tr = document.createElement('tr');
-  tr.innerHTML = `<td>${{k}}</td><td>${{v.entries}}</td><td>${{v.searches}}</td><td>${{v.voice}}</td><td>${{v.home_tagged}}</td>`;
-  actbody.appendChild(tr);
-}});
+}} else {{
+  showError('Graphiques bloqués — lance takeout-audit.sh (serveur local http://127.0.0.1:8765). Les tableaux ci-dessous restent visibles.');
+}}
 
 const TAG_LABELS = {{
   intime:'Intime', sante:'Santé', adulte:'Adulte', vocal:'Vocale', domicile:'Domicile',
@@ -813,7 +917,8 @@ function renderRegrets() {{
     tr.className = 'regret-row';
     const flags = [r.voice?'🎤':'', r.home?'🏠':'', r.device?'📍':''].filter(Boolean).join(' ');
     const tags = r.tags.map(t => `<span class="tag ${{t}}">${{TAG_LABELS[t]||t}}</span>`).join('');
-    tr.innerHTML = `<td class="score">${{r.score}}</td><td>${{r.query}}</td><td>${{r.date||'—'}}</td><td>${{tags}}</td><td>${{flags}}</td>`;
+    const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    tr.innerHTML = `<td class="score">${{r.score}}</td><td>${{esc(r.query)}}</td><td>${{esc(r.date||'—')}}</td><td>${{tags}}</td><td>${{flags}}</td>`;
     regretBody.appendChild(tr);
   }});
 }}
@@ -842,6 +947,10 @@ if (rtags.length) {{
     options:{{ indexAxis:'y', plugins:{{legend:{{display:false}}}}, scales:{{x:{{ticks:{{color:'#a9b1d6'}}}},y:{{ticks:{{color:'#a9b1d6'}}}}}} }}
   }});
 }}
+}} catch (err) {{
+  console.error(err);
+  showError('Erreur JS: ' + err);
+}}
 </script>
 </body>
 </html>
@@ -849,11 +958,28 @@ if (rtags.length) {{
 
 
 def render_html(data: dict[str, Any], output: Path, account: str, total_bytes: int) -> None:
-    content = HTML_TEMPLATE.replace("__ACCOUNT__", html.escape(account))
+    chart_data = dict(data)
+    chart_data["location"] = dict(data["location"])
+    chart_data["location"]["heat_points"] = data["location"]["heat_points"][:1500]
+
+    # Template écrit pour .format() ; on utilise .replace() → dédoubler les accolades.
+    content = HTML_TEMPLATE.replace("{{", "{").replace("}}", "}")
+    content = content.replace("__ACCOUNT__", html.escape(account))
     content = content.replace("__DATE__", datetime.now().strftime("%d/%m/%Y %H:%M"))
     content = content.replace("__SIZE__", human_size(total_bytes))
-    content = content.replace("__DATA_JSON__", json.dumps(data, ensure_ascii=False))
-    # Fix typo in template
+    content = content.replace("__STATIC_CARDS__", render_static_cards(data))
+    content = content.replace("__STATIC_FINDINGS__", render_static_findings(data["findings"]))
+    content = content.replace("__STATIC_PLACES__", render_static_places(data["location"]["top_places"]))
+    content = content.replace("__STATIC_AUDIT__", render_static_audit(data["inventory"]))
+    content = content.replace(
+        "__STATIC_ACTIVITY__", render_static_activity(data["activity"]["categories"])
+    )
+    content = content.replace(
+        "__STATIC_REGRETS__", render_static_regrets(data["searches"]["regrets"])
+    )
+    content = content.replace(
+        "__DATA_JSON__", json.dumps(chart_data, ensure_ascii=False).replace("</", "<\\/")
+    )
     output.write_text(content, encoding="utf-8")
 
 
@@ -961,7 +1087,9 @@ def main() -> int:
     out = Path(args.output) if args.output else root / "audit-dashboard.html"
     render_html(data, out, account, total_bytes)
     log(f"\n✓ Dashboard généré: {out}")
-    log(f"  Ouvrir: xdg-open '{out}'")
+    log(f"  Bonne méthode: ~/scripts/takeout-audit.sh")
+    log(f"  Ou: cd '{out.parent}' && python3 -m http.server 8765")
+    log(f"       → http://127.0.0.1:8765/{out.name}")
     if loc.years:
         log(f"  Géoloc: {loc.years[0]}–{loc.years[-1]} ({len(loc.years)} ans)")
     if loc.raw_points:
