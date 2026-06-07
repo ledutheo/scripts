@@ -60,6 +60,72 @@ ACTIVITY_PATTERNS = {
     "lieu_appareil": re.compile(r"D'après votre appareil|From your device", re.I),
 }
 
+SEARCH_BLOCK_SPLIT = re.compile(r'<div class="outer-cell[^"]*">', re.I)
+SEARCH_QUERY_RE = re.compile(
+    r'google\.com/search\?q=([^"&]+)|'
+    r"Vous avez recherché[^<]*<a[^>]*>([^<]+)</a>|"
+    r"You searched for[^<]*<a[^>]*>([^<]+)</a>",
+    re.I,
+)
+SEARCH_DATE_RE = re.compile(
+    r"(\d{1,2}\s+(?:janv(?:ier)?|févr(?:ier)?|fevr(?:ier)?|mars|avr(?:il)?|"
+    r"mai|juin|juil(?:let)?|août|aout|sept(?:embre)?|oct(?:obre)?|nov(?:embre)?|"
+    r"déc(?:embre)?|dec(?:embre)?)\.?\s+\d{4},\s+\d{2}:\d{2}:\d{2}\s+[A-Z0-9+−-]+)",
+    re.I,
+)
+SEARCH_HOUR_RE = re.compile(r",\s+(\d{2}):\d{2}:\d{2}")
+
+SEARCH_SOURCES = frozenset(
+    {
+        "Recherche",
+        "Recherche audio",
+        "Assistant",
+        "Chrome",
+        "YouTube",
+        "Maps",
+        "Recherche de vidéos",
+        "Recherche d_images",
+    }
+)
+
+# (id, libellé, motif, points de score « regret »)
+REGRET_RULES: list[tuple[str, str, re.Pattern[str], int]] = [
+    ("intime", "Intime / corps", re.compile(
+        r"body\s*count|sexe|sexual|porn|xxx|nude|nue?s?|érot|erot|orgasme|"
+        r"contracept|grossesse|bébé|bebe|faire l.?amour|libido|onlyfans|"
+        r"plan cul|sodom|fellation|masturb|penis|vagin|seins|nichons",
+        re.I,
+    ), 35),
+    ("sante", "Santé / médicaments", re.compile(
+        r"médic|medic|doliprane|paracét|paracet|ibuprof|antibio|sympt[oô]me|"
+        r"maladie|diagnostic|cancer|depression|dépression|anxiété|anxiete|"
+        r"psychiat|suicid|overdose|pharmacie|\d{7,}\s+\d{7}",  # codes médicaux
+        re.I,
+    ), 35),
+    ("adulte", "Contenu adulte", re.compile(
+        r"sexy|hentai|rule34|xnxx|pornhub|xhamster|chaturbate|"
+        r"ai goddess|nsfw|fetish|fétich",
+        re.I,
+    ), 40),
+    ("politique", "Polémique / complot", re.compile(
+        r"wikileaks|complot|mensonge|illuminati|qanon|"
+        r"pas américain|pas americain|fake news|deep state",
+        re.I,
+    ), 25),
+    ("rant", "Rant / conversation avec Google", re.compile(
+        r"tu as trouvé|tu peux répondre|c'est triste|pourquoi tu|"
+        r"réponds? à|dis moi|est-ce que tu|il y a \d+ ans tu pouvais|"
+        r"de plus en plus nul",
+        re.I,
+    ), 30),
+    ("absurde", "Absurde / impulsif", re.compile(
+        r"^(\d{10,}|test|aze|asdf|qwerty|blabla|mdr+|lol+)$", re.I,
+    ), 20),
+]
+
+MIN_REGRET_SCORE = 25
+MAX_REGRET_EXPORT = 400
+
 
 def human_size(num: int) -> str:
     for unit in ("o", "Ko", "Mo", "Go", "To"):
@@ -106,6 +172,14 @@ class ActivityStats:
     voice_entries: int = 0
     home_tagged: int = 0
     device_tagged: int = 0
+
+
+@dataclass
+class SearchStats:
+    total: int = 0
+    flagged: int = 0
+    by_tag: dict[str, int] = field(default_factory=dict)
+    regrets: list[dict[str, Any]] = field(default_factory=list)
 
 
 def classify_sensitivity(rel_path: str) -> tuple[str, str, str] | None:
@@ -260,10 +334,141 @@ def sample_records_json(root: Path, max_points: int = 3000) -> LocationStats:
 
 
 def extract_search_query(block: str) -> str | None:
-    m = re.search(r'google\.com/search\?q=([^"&]+)', block)
+    m = SEARCH_QUERY_RE.search(block)
+    if not m:
+        return None
+    raw = next((g for g in m.groups() if g), None)
+    if not raw:
+        return None
+    if "search?q=" in raw or raw.startswith("http"):
+        m2 = re.search(r"search\?q=([^&]+)", raw)
+        if m2:
+            raw = m2.group(1)
+    query = unquote_plus(raw).replace("+", " ").strip()
+    query = re.sub(r"\s+", " ", query)
+    return query[:300] if query else None
+
+
+def extract_search_date(block: str) -> str:
+    m = SEARCH_DATE_RE.search(block)
+    return m.group(1) if m else ""
+
+
+def extract_search_hour(block: str) -> int | None:
+    m = SEARCH_HOUR_RE.search(block)
     if m:
-        return unquote_plus(m.group(1)).replace("+", " ")[:200]
+        return int(m.group(1))
     return None
+
+
+def score_search_regret(
+    query: str,
+    *,
+    voice: bool,
+    home: bool,
+    device: bool,
+    hour: int | None,
+) -> tuple[int, list[str]]:
+    score = 0
+    tags: list[str] = []
+    qlower = query.lower()
+
+    for tag_id, _label, pattern, points in REGRET_RULES:
+        if pattern.search(qlower):
+            score += points
+            tags.append(tag_id)
+
+    if voice:
+        score += 35
+        if "vocal" not in tags:
+            tags.append("vocal")
+    if home:
+        score += 25
+        if "domicile" not in tags:
+            tags.append("domicile")
+    if device:
+        score += 15
+        if "gps" not in tags:
+            tags.append("gps")
+    if hour is not None and hour < 5:
+        score += 20
+        if "nocturne" not in tags:
+            tags.append("nocturne")
+    if len(query) > 90:
+        score += 25
+        if "rant" not in tags:
+            tags.append("rant")
+
+    return score, tags
+
+
+def parse_searches(root: Path) -> SearchStats:
+    stats = SearchStats()
+    seen_queries: set[tuple[str, str, str]] = set()
+    regrets: list[dict[str, Any]] = []
+
+    html_files = list(root.rglob("MonActivité.html")) + list(root.rglob("My Activity.html"))
+    processed: set[str] = set()
+
+    for fpath in html_files:
+        source = fpath.parent.name
+        if source not in SEARCH_SOURCES:
+            continue
+        key = f"{source}:{fpath.stat().st_size}"
+        if key in processed:
+            continue
+        processed.add(key)
+
+        try:
+            content = fpath.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        for block in SEARCH_BLOCK_SPLIT.split(content)[1:]:
+            if not ACTIVITY_PATTERNS["recherche"].search(block):
+                continue
+            query = extract_search_query(block)
+            if not query:
+                continue
+
+            date = extract_search_date(block)
+            dedup_key = (source, query, date)
+            if dedup_key in seen_queries:
+                continue
+            seen_queries.add(dedup_key)
+
+            voice = bool(ACTIVITY_PATTERNS["vocal"].search(block))
+            home = bool(ACTIVITY_PATTERNS["lieu_domicile"].search(block))
+            device = bool(ACTIVITY_PATTERNS["lieu_appareil"].search(block))
+            hour = extract_search_hour(block)
+
+            stats.total += 1
+            score, tags = score_search_regret(
+                query, voice=voice, home=home, device=device, hour=hour
+            )
+            if score < MIN_REGRET_SCORE:
+                continue
+
+            stats.flagged += 1
+            for tag in tags:
+                stats.by_tag[tag] = stats.by_tag.get(tag, 0) + 1
+
+            regrets.append(
+                {
+                    "query": query,
+                    "date": date,
+                    "source": source,
+                    "score": score,
+                    "tags": tags,
+                    "voice": voice,
+                    "home": home,
+                    "device": device,
+                }
+            )
+
+    regrets.sort(key=lambda r: (-r["score"], r["date"]))
+    stats.regrets = regrets[:MAX_REGRET_EXPORT]
+    return stats
 
 
 def parse_activity(root: Path) -> ActivityStats:
@@ -366,6 +571,38 @@ def build_privacy_findings(
     return findings
 
 
+def build_search_findings(searches: SearchStats) -> list[dict[str, str]]:
+    if not searches.total:
+        return []
+    findings = [
+        {
+            "level": "élevé",
+            "title": f"{searches.flagged:,} recherches « à regretter » sur {searches.total:,}".replace(",", " "),
+            "detail": (
+                "Classées par mots-clés (intime, santé, vocal, domicile, nocturne…). "
+                "Voir la section dédiée dans le dashboard."
+            ),
+        }
+    ]
+    if searches.by_tag:
+        top = sorted(searches.by_tag.items(), key=lambda x: -x[1])[:5]
+        labels = {
+            "intime": "intime", "sante": "santé", "adulte": "adulte",
+            "vocal": "vocale", "domicile": "au domicile", "nocturne": "nocturne",
+            "rant": "rant", "politique": "polémique", "gps": "GPS",
+            "absurde": "absurde",
+        }
+        detail = ", ".join(f"{labels.get(k, k)} ({v})" for k, v in top)
+        findings.append(
+            {
+                "level": "élevé",
+                "title": "Top catégories de regrets",
+                "detail": detail,
+            }
+        )
+    return findings
+
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -405,6 +642,15 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
 .finding.élevé {{ border-color:var(--high); }}
 .finding.moyen {{ border-color:var(--med); }}
 .warn {{ background:#3d2e1e; border:1px solid var(--high); border-radius:8px; padding:1rem; margin:1rem 2rem; }}
+.regret-toolbar {{ display:flex; flex-wrap:wrap; gap:.5rem; margin:.8rem 0; align-items:center; }}
+.regret-toolbar input {{ flex:1; min-width:200px; padding:.5rem .8rem; border-radius:6px; border:1px solid #414868; background:#1a1b26; color:var(--text); }}
+.chip {{ padding:.25rem .6rem; border-radius:999px; border:1px solid #414868; background:#1a1b26; color:#a9b1d6; cursor:pointer; font-size:.8rem; }}
+.chip.active {{ background:var(--accent); color:#1a1b26; border-color:var(--accent); }}
+.regret-row {{ font-size:.82rem; }}
+.regret-row td:first-child {{ max-width:520px; word-break:break-word; }}
+.tag {{ display:inline-block; padding:.1rem .45rem; margin:.1rem; border-radius:4px; font-size:.72rem; background:#1f2335; color:#bb9af7; }}
+.tag.vocal,.tag.nocturne,.tag.intime,.tag.adulte {{ background:#3d2230; color:var(--crit); }}
+.score {{ font-weight:700; color:var(--crit); }}
 </style>
 </head>
 <body>
@@ -427,6 +673,19 @@ th,td {{ padding:.5rem; text-align:left; border-bottom:1px solid #414868; }}
   <div class="panel"><h2>Top lieux visités</h2><table id="places"><thead><tr><th>Lieu</th><th>Visites</th><th>Type</th></tr></thead><tbody></tbody></table></div>
   <div class="panel"><h2>Audit par catégorie</h2><table id="audit"><thead><tr><th>Niveau</th><th>Catégorie</th><th>Taille</th><th>Fichiers</th><th>Risque</th></tr></thead><tbody></tbody></table></div>
   <div class="panel"><h2>Mon activité (compteurs)</h2><table id="activity"><thead><tr><th>Service</th><th>Entrées</th><th>Recherches</th><th>Vocal</th><th>Tag domicile</th></tr></thead><tbody></tbody></table></div>
+  <div class="panel" id="regretPanel">
+    <h2>😅 Recherches à regretter</h2>
+    <p style="color:#a9b1d6;font-size:.9rem">Analyse locale par mots-clés — intime, santé, vocal, domicile, nocturne, rant… Filtre pour parcourir vite ce que Google a gardé.</p>
+    <div class="regret-toolbar">
+      <input id="regretFilter" type="search" placeholder="Filtrer une requête…">
+      <span id="regretChips"></span>
+    </div>
+    <canvas id="regretChart" height="80"></canvas>
+    <p id="regretSummary" style="color:#565f89;font-size:.85rem"></p>
+    <div style="max-height:520px;overflow:auto;margin-top:.5rem">
+      <table id="regrets"><thead><tr><th>Score</th><th>Requête</th><th>Date</th><th>Tags</th><th>Flags</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
 </div>
 <script>
 const DATA = __DATA_JSON__;
@@ -442,6 +701,7 @@ const cards = [
   ['Entrées activité', DATA.activity.total_entries.toLocaleString('fr')],
   ['Enregistrements vocaux', DATA.activity.voice_entries],
   ['Recherches taguées domicile', DATA.activity.home_tagged],
+  ['À regretter', DATA.searches.flagged.toLocaleString('fr')],
 ];
 document.getElementById('cards').innerHTML = cards.map(([l,v])=>
   `<div class="card"><div class="val">${{v}}</div><div class="lbl">${{l}}</div></div>`).join('');
@@ -504,6 +764,59 @@ Object.entries(DATA.activity.categories).sort((a,b)=>b[1].entries-a[1].entries).
   tr.innerHTML = `<td>${{k}}</td><td>${{v.entries}}</td><td>${{v.searches}}</td><td>${{v.voice}}</td><td>${{v.home_tagged}}</td>`;
   actbody.appendChild(tr);
 }});
+
+const TAG_LABELS = {{
+  intime:'Intime', sante:'Santé', adulte:'Adulte', vocal:'Vocale', domicile:'Domicile',
+  nocturne:'Nocturne', rant:'Rant', politique:'Polémique', gps:'GPS', absurde:'Absurde'
+}};
+let activeTag = '';
+const regretBody = document.querySelector('#regrets tbody');
+const regretFilter = document.getElementById('regretFilter');
+const regretSummary = document.getElementById('regretSummary');
+
+function renderRegrets() {{
+  const q = (regretFilter?.value || '').toLowerCase();
+  regretBody.innerHTML = '';
+  const rows = (DATA.searches.regrets || []).filter(r => {{
+    if (activeTag && !r.tags.includes(activeTag)) return false;
+    if (q && !r.query.toLowerCase().includes(q)) return false;
+    return true;
+  }});
+  regretSummary.textContent = `${{rows.length}} affichées · ${{DATA.searches.flagged}} signalées · ${{DATA.searches.total}} recherches extraites`;
+  rows.forEach(r => {{
+    const tr = document.createElement('tr');
+    tr.className = 'regret-row';
+    const flags = [r.voice?'🎤':'', r.home?'🏠':'', r.device?'📍':''].filter(Boolean).join(' ');
+    const tags = r.tags.map(t => `<span class="tag ${{t}}">${{TAG_LABELS[t]||t}}</span>`).join('');
+    tr.innerHTML = `<td class="score">${{r.score}}</td><td>${{r.query}}</td><td>${{r.date||'—'}}</td><td>${{tags}}</td><td>${{flags}}</td>`;
+    regretBody.appendChild(tr);
+  }});
+}}
+
+const chips = document.getElementById('regretChips');
+const allChip = document.createElement('button');
+allChip.className = 'chip active';
+allChip.textContent = 'Toutes';
+allChip.onclick = () => {{ activeTag=''; document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active')); allChip.classList.add('active'); renderRegrets(); }};
+chips.appendChild(allChip);
+Object.entries(DATA.searches.by_tag || {{}}).sort((a,b)=>b[1]-a[1]).forEach(([tag,count]) => {{
+  const b = document.createElement('button');
+  b.className = 'chip';
+  b.textContent = `${{TAG_LABELS[tag]||tag}} (${{count}})`;
+  b.onclick = () => {{ activeTag=tag; document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active')); b.classList.add('active'); renderRegrets(); }};
+  chips.appendChild(b);
+}});
+if (regretFilter) regretFilter.oninput = renderRegrets;
+renderRegrets();
+
+const rtags = Object.entries(DATA.searches.by_tag || {{}}).sort((a,b)=>b[1]-a[1]).slice(0,10);
+if (rtags.length) {{
+  new Chart(document.getElementById('regretChart'), {{
+    type:'bar',
+    data:{{ labels:rtags.map(t=>TAG_LABELS[t[0]]||t[0]), datasets:[{{ data:rtags.map(t=>t[1]), backgroundColor:'#f7768e' }}]}},
+    options:{{ indexAxis:'y', plugins:{{legend:{{display:false}}}}, scales:{{x:{{ticks:{{color:'#a9b1d6'}}}},y:{{ticks:{{color:'#a9b1d6'}}}}}} }}
+  }});
+}}
 </script>
 </body>
 </html>
@@ -559,6 +872,9 @@ def main() -> int:
 
     print("→ Mon activité (HTML) ...")
     activity = parse_activity(root)
+
+    print("→ Recherches (analyse « à regretter ») ...")
+    searches = parse_searches(root)
     activity_dict = {
         "categories": activity.categories,
         "total_entries": activity.total_entries,
@@ -568,6 +884,7 @@ def main() -> int:
     }
 
     findings = build_privacy_findings(inventory, loc, activity)
+    findings.extend(build_search_findings(searches))
     account = "roysten699@gmail.com"  # détecté dans archive_browser.html
 
     data = {
@@ -599,6 +916,12 @@ def main() -> int:
             for i in inventory
         ],
         "findings": findings,
+        "searches": {
+            "total": searches.total,
+            "flagged": searches.flagged,
+            "by_tag": searches.by_tag,
+            "regrets": searches.regrets,
+        },
     }
 
     out = Path(args.output) if args.output else root / "audit-dashboard.html"
@@ -609,6 +932,8 @@ def main() -> int:
         print(f"  Géoloc: {loc.years[0]}–{loc.years[-1]} ({len(loc.years)} ans)")
     if findings:
         print(f"  Alertes: {len(findings)} constats sensibles")
+    if searches.total:
+        print(f"  Recherches: {searches.total} extraites, {searches.flagged} à regretter")
     return 0
 
 
